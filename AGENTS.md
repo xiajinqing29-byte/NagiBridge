@@ -80,7 +80,7 @@
 | `/alerts` | GET/POST | 游戏内警告队列 |
 | `/scan` | GET | 扫描当前地图全部物体 |
 | `/warp` | POST | 传送 `{location, x?, y?}` 矿洞用 `UndergroundMine5` |
-| `/sleep` | POST | 回自己的床睡觉。**自动找床**（不需要先 `/warp` 回家），等传送完成并确认精确站在自己床上才睡；做不到就返回 `ok:false` 而不是硬睡。**必须检查返回值**。`state` 有三种：`slept`（单人，已过夜）/ `ready`（多人，已上床，**日期要等所有人就绪才变**）/ `unknown`（动作已发出但出错，先查 `/state`）。⚠️ **`ok:true` 不等于新的一天开始了** |
+| `/sleep` | POST | 回自己的床睡觉。**自动找床**（不需要先 `/warp` 回家），等传送完成并确认精确站在自己床上才睡；做不到就返回 `ok:false` 而不是硬睡。**必须检查返回值**。`state`：`slept`（单人，已过夜）/ `ready`（多人，已上床，**日期要等所有人就绪才变**，见下方「睡觉期间不要移动」）/ `already_ready`·`already_started`·`day_ending`（重复调用时的幂等回报，不会重睡）/ `unknown`（动作已发出但出错，**看响应里的 `observed` 字段**，不要去查 `/state`——它不暴露这些）。⚠️ **`ok:true` 不等于新的一天开始了** |
 | `/wakeup` | POST | 起床 |
 | `/buy` | POST | 购买 `{id, count, price?}` |
 | `/sell` | POST | 出售到shipping bin |

@@ -178,7 +178,7 @@ TOOLS = [
     },
     {
         "name": "sleep",
-        "description": "Go to bed and end the day. Finds your own bed automatically -- you do NOT need to warp home first. Returns ok:false with a reason if it could not put you in bed (check it; sleeping is not guaranteed).",
+        "description": "Go to bed and end the day. Finds your own bed automatically -- you do NOT need to warp home first. Check the result: state=slept means the day ended; state=ready means you are in bed but the day only ends once every player is ready -- while it is ready you MUST NOT call any movement command (move, warp, position, wakeup) until the date changes, because moving you off the bed leaves the other players stuck on a black screen; state=already_ready/already_started/day_ending mean a previous sleep is still in effect and this call did nothing; ok:false with state=unknown means the action was dispatched but errored -- read the observed field in the response instead of retrying blind.",
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
     {
