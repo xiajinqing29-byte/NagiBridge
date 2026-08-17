@@ -64,6 +64,9 @@ public class ModEntry : Mod
         /// ticks stall when the game is backgrounded -- and not DateTime, which jumps with clock changes.
         /// </summary>
         public long DeadlineMs;
+
+        /// <summary>Whether we already tried to reposition within the home map (only ever done once).</summary>
+        public bool NudgedToBed;
     }
 
 
@@ -1791,7 +1794,12 @@ public class ModEntry : Mod
                     return;
                 }
 
-                Game1.warpFarmer(homeName, bedSpot.X, bedSpot.Y, false);
+                // Use the 5-arg overload. The 4-arg one we used before takes a *flip* bool, not
+                // isStructure -- so passing false silently told the game "this is a top-level map".
+                // A farmhand's cabin is a building interior, and resolving it as a top-level map is why
+                // the requested bed tile was discarded and the farmer kept landing at the entrance.
+                var isStructure = house is StardewValley.Locations.Cabin || house!.GetParentLocation() != null;
+                Game1.warpFarmer(homeName, bedSpot.X, bedSpot.Y, 2, isStructure);
 
                 // Wall-clock deadline, not a tick count: ticks stall when the game is backgrounded or
                 // running below 60fps, and a stalled tick budget would outlive the caller's HTTP
@@ -2080,13 +2088,27 @@ public class ModEntry : Mod
 
         if (!IsOnOwnBed(farmer, house!, attempt.HomeName, attempt.BedSpot))
         {
+            // We're in the right building but not on the bed -- the cross-map warp dropped us at the
+            // entrance. Nudge within this map once and re-check on a later tick. A same-map move needs
+            // no cross-map handshake, so it is far more reliable than re-issuing the warp; and the
+            // verification below still has the final say, so this can only turn a refusal into a
+            // correctly-verified sleep, never into sleeping somewhere wrong.
+            if (!attempt.NudgedToBed)
+            {
+                attempt.NudgedToBed = true;
+                Monitor.Log($"/sleep: landed at {farmer.TilePoint.X},{farmer.TilePoint.Y} instead of the bed at {attempt.BedSpot.X},{attempt.BedSpot.Y}; moving within {attempt.HomeName}", LogLevel.Debug);
+                farmer.Position = new Vector2(attempt.BedSpot.X, attempt.BedSpot.Y) * Game1.tileSize;
+                return;
+            }
+
             FinishSleepAttempt(new
             {
                 ok = false,
-                error = "arrived home but not on your own bed -- refusing to sleep (declaring ready here would hang the other players)",
+                error = "arrived home but could not get onto your own bed -- refusing to sleep (declaring ready here would hang the other players)",
                 home = attempt.HomeName,
                 bed = $"{attempt.BedSpot.X},{attempt.BedSpot.Y}",
                 at = $"{farmer.TilePoint.X},{farmer.TilePoint.Y}",
+                observed = ObserveSleepState(farmer),
             });
             return;
         }
