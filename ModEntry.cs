@@ -1721,20 +1721,30 @@ public class ModEntry : Mod
         {
             try
             {
-                // Idempotent: a second /sleep after already declaring ready must not re-answer
-                // "Sleep_Yes" (that re-runs the ready-check). timeWentToBed is the game's own record of
-                // having gone to bed; it is reset to 0 when the ready-check is cancelled. Note that
-                // isInBed is NOT usable for this -- Farmer.Update recomputes it every tick from whether
-                // the current tile is a bed, so it stays true after a cancel.
+                // Idempotent: once this farmer has gone to bed, never re-answer "Sleep_Yes" (that
+                // re-runs the ready-check). timeWentToBed is the game's own record of having gone to
+                // bed and is reset to 0 when the check is cancelled -- isInBed is NOT usable here,
+                // because Farmer.Update recomputes it every tick from whether the current tile is a
+                // bed, so it stays true even after a cancel.
+                //
+                // Don't collapse this into "already ready", though: startSleep writes timeWentToBed
+                // *before* marking the player ready, so a non-zero value on its own only proves the
+                // attempt started. Report what is actually observable.
                 var current = Game1.player;
-                if (current != null && current.timeWentToBed.Value != 0 && !Game1.newDay)
+                if (current != null && current.timeWentToBed.Value != 0)
                 {
-                    tcs.SetResult(new
-                    {
-                        ok = true,
-                        state = "already_ready",
-                        note = "already went to bed; waiting for the day to end",
-                    });
+                    if (Game1.newDay)
+                        tcs.SetResult(new { ok = true, state = "day_ending", note = "the day is already ending" });
+                    else if (IsSleepReadyCheckOpen())
+                        tcs.SetResult(new { ok = true, state = "already_ready", note = "already in bed and ready; the day ends when everyone is ready" });
+                    else
+                        tcs.SetResult(new
+                        {
+                            ok = true,
+                            state = "already_started",
+                            note = "already went to bed, but no sleep ready-check is on screen -- state is ambiguous; not retrying the sleep action",
+                            observed = ObserveSleepState(current),
+                        });
                     return;
                 }
 
@@ -1932,6 +1942,10 @@ public class ModEntry : Mod
             // any non-null action. It is checked only to catch an outright rejection.
             if (!loc.answerDialogueAction("Sleep_Yes", Array.Empty<string>()))
             {
+                // Outright refusal, so nothing was marked ready and undoing our own writes is safe --
+                // unlike the catch below, where the throw may land after the ready-check opened.
+                // Note the isInBed write only holds for this tick (Farmer.Update recomputes it from the
+                // current tile); the meaningful part of this rollback is sleptInTemporaryBed.
                 farmer.isInBed.Value = prevInBed;
                 farmer.sleptInTemporaryBed.Value = prevTempBed;
                 return new
@@ -1946,21 +1960,28 @@ public class ModEntry : Mod
         }
         catch (Exception ex)
         {
-            farmer.isInBed.Value = prevInBed;
-            farmer.sleptInTemporaryBed.Value = prevTempBed;
-
-            // Deliberately reported as unknown, not as failure. The throw can happen *after* the game
-            // has already marked this player ready and opened the ready-check (the announce/chat code
-            // runs later in that path), so claiming "did not sleep" would be a lie the caller might act
-            // on. Undoing a net-synced ready needs more than resetting these two flags, so this reports
-            // the uncertainty instead of pretending either way.
+            // Deliberately NOT rolling isInBed / sleptInTemporaryBed back here.
+            //
+            // We only get this far after verifying the farmer is standing on their own real bed, and we
+            // set those flags to match that fact. If the throw happened after the game already marked
+            // this player ready, restoring the old values would briefly produce "ready but not in bed"
+            // -- exactly the inconsistent state this whole fix exists to prevent. Staying on the real
+            // bed is the safe fail state; if the throw happened before ready, staying is harmless.
+            //
+            // Reported as unknown rather than failure: the throw can land after the ready-check has
+            // already opened (the announce/chat code runs later in that path), so claiming "did not
+            // sleep" would be a lie the caller might act on. Undoing a net-synced ready is out of scope
+            // here, so report the uncertainty with the evidence instead of guessing either way.
+            Monitor.Log($"/sleep threw after dispatching the sleep action: {ex}", LogLevel.Error);
             return new
             {
                 ok = false,
                 state = "unknown",
                 error = $"sleep action threw after being sent: {ex.Message}",
                 home = homeName,
-                note = "the go-to-bed action was already dispatched; this player may or may not be marked ready. Check /state before retrying.",
+                bed = $"{bedSpot.X},{bedSpot.Y}",
+                note = "the go-to-bed action was already dispatched; this player may or may not be marked ready. Inspect 'observed' rather than retrying blind.",
+                observed = ObserveSleepState(farmer),
             };
         }
 
@@ -1976,6 +1997,34 @@ public class ModEntry : Mod
             home = homeName,
             bed = $"{bedSpot.X},{bedSpot.Y}",
             note = ended ? "the day is ending" : "in bed and ready; the day ends when everyone is ready",
+        };
+    }
+
+    /// <summary>True when a "sleep" ready-check is on screen -- direct evidence this player is ready.</summary>
+    private static bool IsSleepReadyCheckOpen()
+    {
+        return Game1.activeClickableMenu is ReadyCheckDialog dialog
+            && string.Equals(dialog.checkName, "sleep", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Sleep-related state that /state does not expose (timeWentToBed, isInBed, newDay, fade, which
+    /// ready-check is open). Attached to ambiguous /sleep responses so "state is unclear" comes with the
+    /// evidence instead of pointing the caller at an endpoint that cannot show any of it.
+    /// </summary>
+    private static object ObserveSleepState(Farmer? farmer)
+    {
+        return new
+        {
+            timeWentToBed = farmer?.timeWentToBed.Value,
+            isInBed = farmer?.isInBed.Value,
+            sleptInTemporaryBed = farmer?.sleptInTemporaryBed.Value,
+            newDay = Game1.newDay,
+            fadeToBlack = Game1.fadeToBlack,
+            activeMenu = Game1.activeClickableMenu?.GetType().Name,
+            readyCheck = (Game1.activeClickableMenu as ReadyCheckDialog)?.checkName,
+            location = farmer?.currentLocation?.NameOrUniqueName,
+            at = farmer == null ? null : $"{farmer.TilePoint.X},{farmer.TilePoint.Y}",
         };
     }
 
