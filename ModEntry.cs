@@ -198,6 +198,11 @@ public class ModEntry : Mod
     private void OnReturnedToTitle(object? sender, ReturnedToTitleEventArgs e)
     {
         ClearMovementState();
+
+        // Release any in-flight /sleep. Without this the attempt would sit there until it timed out,
+        // blocking the next /sleep (the guard rejects a second attempt) and reporting a misleading
+        // "timed out waiting for the warp" when the real reason is that the world went away.
+        FinishSleepAttempt(new { ok = false, error = "returned to title while sleeping" });
     }
 
     private void ClearMovementState()
