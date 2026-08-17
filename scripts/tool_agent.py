@@ -178,7 +178,7 @@ TOOLS = [
     },
     {
         "name": "sleep",
-        "description": "Go to bed and end the day",
+        "description": "Go to bed and end the day. Finds your own bed automatically -- you do NOT need to warp home first. Returns ok:false with a reason if it could not put you in bed (check it; sleeping is not guaranteed).",
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
     {

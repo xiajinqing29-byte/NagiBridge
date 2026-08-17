@@ -80,7 +80,7 @@
 | `/alerts` | GET/POST | 游戏内警告队列 |
 | `/scan` | GET | 扫描当前地图全部物体 |
 | `/warp` | POST | 传送 `{location, x?, y?}` 矿洞用 `UndergroundMine5` |
-| `/sleep` | POST | 睡觉 |
+| `/sleep` | POST | 回自己的床睡觉、结束这一天。**自动找床**（不需要先 `/warp` 回家），会等传送完成并确认真的在床上才睡。**必须检查返回值**：`ok:false` 时 `error` 说明卡在哪一步 |
 | `/wakeup` | POST | 起床 |
 | `/buy` | POST | 购买 `{id, count, price?}` |
 | `/sell` | POST | 出售到shipping bin |

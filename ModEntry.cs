@@ -36,6 +36,36 @@ public class ModEntry : Mod
     private readonly object _queueLock = new();
     private int _port;
 
+    /// <summary>
+    /// In-flight /sleep attempt. See <see cref="HandleSleep"/>.
+    ///
+    /// Why this exists: /sleep used to warp the farmer to a hardcoded tile (10,6) and then, after a
+    /// fixed 3000ms timer, force isInBed = true and answer "Sleep_Yes" without ever checking where the
+    /// farmer actually ended up. In multiplayer that deadlocked the whole farm: the bed is not at
+    /// (10,6) in most homes (cabins are smaller than the farmhouse, and the farmhouse itself swaps maps
+    /// on upgrade / marriage), so the game rejected the target and dropped the farmer at the entrance
+    /// instead. The farmer still reached "ready", the last player to sleep sent everyone into NewDay,
+    /// but a farmer who is not on a bed never transitions -- so the host sat on a black screen forever
+    /// while the farmer stood in the doorway.
+    ///
+    /// Fix: ask the game where the bed is, wait for the warp to actually finish, verify the farmer is
+    /// standing on a bed, and only then sleep. If any step fails, report it instead of pretending.
+    /// </summary>
+    private SleepAttempt? _sleepAttempt;
+
+    /// <summary>Monotonic counter used to invalidate stale <see cref="_sleepAttempt"/> callbacks.</summary>
+    private int _sleepGeneration;
+
+    private sealed class SleepAttempt
+    {
+        public TaskCompletionSource<object> Tcs = null!;
+        public string HomeName = "";
+        public Point BedSpot;
+        public int Generation;
+        public int TicksWaited;
+        public int TicksLimit;
+    }
+
     // Pathfinding state
     private Queue<Point>? _pathQueue;
     private int _pathTickCooldown;
@@ -337,6 +367,15 @@ public class ModEntry : Mod
                 try { _mainThreadQueue.Dequeue().Invoke(); }
                 catch (Exception ex) { Monitor.Log($"Queued action error: {ex}", LogLevel.Error); }
             }
+        }
+
+        // Advance an in-flight /sleep attempt. Must run every tick (not on a timer) so we can react to
+        // the warp actually completing instead of guessing how long it takes.
+        try { TickSleepAttempt(); }
+        catch (Exception ex)
+        {
+            Monitor.Log($"Sleep attempt error: {ex}", LogLevel.Error);
+            FinishSleepAttempt(new { ok = false, error = $"internal error: {ex.Message}" });
         }
 
         // Freeze time if paused
@@ -1652,7 +1691,12 @@ public class ModEntry : Mod
 
     /// <summary>
     /// POST /sleep
-    /// Warps the farmer to their bed and triggers sleep (end of day).
+    /// Sends the farmer to their own bed and ends the day.
+    ///
+    /// Returns only once the outcome is known: {ok:true, ...} when the farmer is actually asleep, or
+    /// {ok:false, error:...} describing which step failed. It never reports success for work that has
+    /// merely been scheduled -- callers relied on that and had no way to tell a stuck farm from a
+    /// sleeping one.
     /// </summary>
     private object HandleSleep()
     {
@@ -1664,71 +1708,68 @@ public class ModEntry : Mod
         {
             try
             {
-                var farmer = Game1.player;
-
-                // Find home: try homeLocation, then scan all locations for a cabin belonging to this farmer
-                var homeName = farmer.homeLocation.Value;
-                GameLocation homeLoc = null;
-                if (!string.IsNullOrEmpty(homeName))
-                    homeLoc = Game1.getLocationFromName(homeName);
-
-                if (homeLoc == null)
+                // Refuse rather than stack up. A second attempt while one is in flight used to queue a
+                // second set of delayed callbacks that fired against whatever state existed later.
+                if (_sleepAttempt != null)
                 {
-                    // Scan for cabin with this farmer's unique ID
-                    foreach (var loc in Game1.locations)
-                    {
-                        if (loc is StardewValley.Locations.Cabin cabin && cabin.owner == farmer)
-                        {
-                            homeLoc = cabin;
-                            homeName = cabin.Name;
-                            break;
-                        }
-                    }
+                    tcs.SetResult(new { ok = false, error = "a /sleep attempt is already in progress" });
+                    return;
                 }
-
-                // Fallback to FarmHouse for host
-                if (homeLoc == null)
+                if (Game1.newDay)
                 {
-                    homeLoc = Game1.getLocationFromName("FarmHouse");
-                    homeName = "FarmHouse";
+                    tcs.SetResult(new { ok = false, error = "the day is already ending" });
+                    return;
                 }
-
-                if (homeLoc == null)
+                if (Game1.eventUp || Game1.currentMinigame != null)
                 {
-                    tcs.SetResult(new { ok = false, error = "Cannot find home location" });
+                    tcs.SetResult(new { ok = false, error = "busy: an event or minigame is active" });
                     return;
                 }
 
-                var bedX = 10;
-                var bedY = 6;
-
-                var needsWarp = farmer.currentLocation.Name != homeLoc.Name;
-                if (needsWarp)
+                var farmer = Game1.player;
+                if (farmer == null)
                 {
-                    Game1.warpFarmer(homeName, bedX, bedY, false);
+                    tcs.SetResult(new { ok = false, error = "no player" });
+                    return;
                 }
 
-                // Longer delay for farmhand warp sync
-                var delay = needsWarp ? 3000 : 500;
-                DelayedAction.functionAfterDelay(() =>
+                var homeLoc = ResolveHomeLocation(farmer, out var homeName);
+                if (homeLoc == null)
                 {
-                    var f = Game1.player;
-                    f.isInBed.Value = true;
-                    f.sleptInTemporaryBed.Value = false;
-                    f.currentLocation.answerDialogueAction("Sleep_Yes", Array.Empty<string>());
+                    tcs.SetResult(new { ok = false, error = "cannot find this farmer's home" });
+                    return;
+                }
 
-                    DelayedAction.functionAfterDelay(() =>
-                    {
-                        if (Game1.activeClickableMenu != null)
-                        {
-                            Game1.player.currentLocation.answerDialogueAction("Sleep_Yes", Array.Empty<string>());
-                            Game1.pressActionButton(Game1.input.GetKeyboardState(), Game1.input.GetMouseState(),
-                                Game1.input.GetGamePadState());
-                        }
-                    }, 1000);
-                }, delay);
+                // Ask the game where the bed is. Never hardcode it: cabins are smaller than the
+                // farmhouse, the farmhouse swaps to a different map on each upgrade and on marriage,
+                // and since 1.6 the bed is furniture the player can move.
+                if (!TryGetBedSpot(homeLoc, out var bedSpot, out var bedError))
+                {
+                    tcs.SetResult(new { ok = false, error = bedError, home = homeName });
+                    return;
+                }
 
-                tcs.SetResult(new { ok = true, action = "sleeping", home = homeName, bed = $"{bedX},{bedY}" });
+                // Already on a bed at home: skip the warp entirely.
+                if (IsAtHomeOnBed(farmer, homeName))
+                {
+                    var immediate = SleepNow(farmer, homeName, bedSpot);
+                    tcs.SetResult(immediate);
+                    return;
+                }
+
+                Game1.warpFarmer(homeName, bedSpot.X, bedSpot.Y, false);
+
+                // 10 seconds at 60 ticks/sec. Cross-map warps for a farmhand need a server round trip;
+                // this is only a giving-up bound, not a guess at how long the warp takes -- the attempt
+                // completes as soon as the warp is observably done.
+                _sleepAttempt = new SleepAttempt
+                {
+                    Tcs = tcs,
+                    HomeName = homeName,
+                    BedSpot = bedSpot,
+                    Generation = ++_sleepGeneration,
+                    TicksLimit = 600,
+                };
             }
             catch (Exception ex)
             {
@@ -1736,6 +1777,184 @@ public class ModEntry : Mod
             }
         });
         return tcs.Task.GetAwaiter().GetResult();
+    }
+
+    /// <summary>Resolves the farmer's own home, preferring unique names so same-named cabins can't collide.</summary>
+    private static GameLocation? ResolveHomeLocation(Farmer farmer, out string homeName)
+    {
+        homeName = farmer.homeLocation.Value ?? "";
+        if (!string.IsNullOrEmpty(homeName))
+        {
+            var byName = Game1.getLocationFromName(homeName);
+            if (byName != null)
+            {
+                homeName = byName.NameOrUniqueName;
+                return byName;
+            }
+        }
+
+        // Fall back to scanning cabins. Compare by owner identity, not by Name: several cabins share
+        // the same Name and matching on it can send a farmhand into someone else's cabin.
+        foreach (var loc in Game1.locations)
+        {
+            if (loc is StardewValley.Locations.Cabin cabin && cabin.owner != null && cabin.owner.UniqueMultiplayerID == farmer.UniqueMultiplayerID)
+            {
+                homeName = cabin.NameOrUniqueName;
+                return cabin;
+            }
+        }
+
+        var farmhouse = Game1.getLocationFromName("FarmHouse");
+        if (farmhouse != null)
+        {
+            homeName = farmhouse.NameOrUniqueName;
+            return farmhouse;
+        }
+
+        homeName = "";
+        return null;
+    }
+
+    /// <summary>Asks the game for this farmer's bed tile, verifying that a bed is really there.</summary>
+    private static bool TryGetBedSpot(GameLocation homeLoc, out Point bedSpot, out string error)
+    {
+        bedSpot = Point.Zero;
+        error = "";
+
+        if (homeLoc is not StardewValley.Locations.FarmHouse house)
+        {
+            error = $"home '{homeLoc.NameOrUniqueName}' is not a farmhouse or cabin";
+            return false;
+        }
+
+        var spot = house.GetPlayerBedSpot();
+        if (StardewValley.Objects.BedFurniture.IsBedHere(homeLoc, spot.X, spot.Y))
+        {
+            bedSpot = spot;
+            return true;
+        }
+
+        // GetPlayerBedSpot falls back to a map default when it can't find the bed; go straight to the
+        // furniture in that case.
+        var bed = house.GetPlayerBed();
+        if (bed != null)
+        {
+            bedSpot = bed.GetBedSpot();
+            return true;
+        }
+
+        error = $"no bed found in '{homeLoc.NameOrUniqueName}' (is the bed missing or removed?)";
+        return false;
+    }
+
+    private static bool IsAtHomeOnBed(Farmer farmer, string homeName)
+    {
+        var loc = farmer.currentLocation;
+        if (loc == null || loc.NameOrUniqueName != homeName)
+            return false;
+        return StardewValley.Objects.BedFurniture.IsBedHere(loc, farmer.TilePoint.X, farmer.TilePoint.Y);
+    }
+
+    /// <summary>
+    /// Actually goes to sleep. Only call once the farmer is confirmed to be standing on their bed --
+    /// answering "Sleep_Yes" anywhere else marks the farmer ready without letting them transition,
+    /// which is what deadlocked multiplayer farms.
+    /// </summary>
+    private object SleepNow(Farmer farmer, string homeName, Point bedSpot)
+    {
+        var loc = farmer.currentLocation;
+        if (loc == null)
+            return new { ok = false, error = "no current location" };
+
+        farmer.isInBed.Value = true;
+        // Only safe now that we know this is the farmer's real bed at home, not a temporary one.
+        farmer.sleptInTemporaryBed.Value = false;
+
+        var answered = loc.answerDialogueAction("Sleep_Yes", Array.Empty<string>());
+        if (!answered)
+        {
+            farmer.isInBed.Value = false;
+            return new
+            {
+                ok = false,
+                error = "the game refused the sleep action",
+                home = homeName,
+                bed = $"{bedSpot.X},{bedSpot.Y}",
+                at = $"{farmer.TilePoint.X},{farmer.TilePoint.Y}",
+            };
+        }
+
+        Monitor.Log($"/sleep: asleep in {homeName} at {farmer.TilePoint.X},{farmer.TilePoint.Y}", LogLevel.Info);
+        return new
+        {
+            ok = true,
+            action = "sleeping",
+            home = homeName,
+            bed = $"{bedSpot.X},{bedSpot.Y}",
+        };
+    }
+
+    /// <summary>Waits for the warp issued by <see cref="HandleSleep"/> to finish, then verifies and sleeps.</summary>
+    private void TickSleepAttempt()
+    {
+        var attempt = _sleepAttempt;
+        if (attempt == null)
+            return;
+
+        // Superseded by a newer attempt: drop this one instead of acting on stale state.
+        if (attempt.Generation != _sleepGeneration)
+        {
+            FinishSleepAttempt(new { ok = false, error = "superseded by a newer /sleep" });
+            return;
+        }
+
+        if (++attempt.TicksWaited > attempt.TicksLimit)
+        {
+            var where = Game1.player?.currentLocation?.NameOrUniqueName ?? "unknown";
+            FinishSleepAttempt(new
+            {
+                ok = false,
+                error = $"timed out waiting for the warp to '{attempt.HomeName}' to finish (still in '{where}')",
+                home = attempt.HomeName,
+            });
+            return;
+        }
+
+        // Warp still in progress -- keep waiting. This is the check the old fixed timer replaced.
+        if (Game1.locationRequest != null || Game1.fadeToBlack)
+            return;
+
+        var farmer = Game1.player;
+        if (farmer?.currentLocation == null)
+            return;
+        if (farmer.currentLocation.NameOrUniqueName != attempt.HomeName)
+            return;
+
+        // Arrived. Verify we are on the bed before claiming to sleep: the game silently relocates the
+        // farmer when the requested tile isn't standable, and that mismatch is the whole bug.
+        if (!StardewValley.Objects.BedFurniture.IsBedHere(farmer.currentLocation, farmer.TilePoint.X, farmer.TilePoint.Y))
+        {
+            FinishSleepAttempt(new
+            {
+                ok = false,
+                error = "arrived home but not on the bed -- refusing to sleep (this would hang other players)",
+                home = attempt.HomeName,
+                bed = $"{attempt.BedSpot.X},{attempt.BedSpot.Y}",
+                at = $"{farmer.TilePoint.X},{farmer.TilePoint.Y}",
+            });
+            return;
+        }
+
+        FinishSleepAttempt(SleepNow(farmer, attempt.HomeName, attempt.BedSpot));
+    }
+
+    private void FinishSleepAttempt(object result)
+    {
+        var attempt = _sleepAttempt;
+        if (attempt == null)
+            return;
+        _sleepAttempt = null;
+        attempt.Tcs.TrySetResult(result);
     }
 
     /// <summary>
