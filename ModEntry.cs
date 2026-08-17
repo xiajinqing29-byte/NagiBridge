@@ -1803,7 +1803,12 @@ public class ModEntry : Mod
                 // alone does NOT get a farmhand onto the bed: measured with isStructure properly set,
                 // a cross-map warp into an interior still lands at the entrance. Landing accurately is
                 // handled after arrival, inside TickSleepAttempt.
-                var isStructure = house is StardewValley.Locations.Cabin || house!.GetParentLocation() != null;
+                // Only a cabin is a building interior here. Utility.getHomeOfFarmer returns exactly
+                // FarmHouse (host) or Cabin (farmhand), so this test is complete.
+                // Do NOT add "|| GetParentLocation() != null" as a safety net: the host's FarmHouse
+                // does have a parent location, yet warp still resolves it as a top-level map -- that
+                // "safety net" made every host cross-map warp fail to complete (measured: 12s timeout).
+                var isStructure = house is StardewValley.Locations.Cabin;
                 Game1.warpFarmer(homeName, bedSpot.X, bedSpot.Y, 2, isStructure);
 
                 // Wall-clock deadline, not a tick count: ticks stall when the game is backgrounded or
