@@ -1738,11 +1738,17 @@ public class ModEntry : Mod
                     else if (IsSleepReadyCheckOpen())
                         tcs.SetResult(new { ok = true, state = "already_ready", note = "already in bed and ready; the day ends when everyone is ready" });
                     else
+                        // ok:false on purpose. timeWentToBed is written *before* the player is marked
+                        // ready, so a non-zero value with no ready-check and no newDay may mean the
+                        // attempt threw before ready was ever set. Reporting that as success would be
+                        // the same "assume it worked" mistake this whole fix exists to remove -- just in
+                        // a different place. Not retrying Sleep_Yes either; the caller decides.
                         tcs.SetResult(new
                         {
-                            ok = true,
+                            ok = false,
                             state = "already_started",
-                            note = "already went to bed, but no sleep ready-check is on screen -- state is ambiguous; not retrying the sleep action",
+                            error = "went to bed earlier, but there is no evidence this player is ready (no sleep ready-check, no new day)",
+                            note = "not retrying the sleep action. Inspect 'observed' to decide.",
                             observed = ObserveSleepState(current),
                         });
                     return;
