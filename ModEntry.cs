@@ -65,8 +65,12 @@ public class ModEntry : Mod
         /// </summary>
         public long DeadlineMs;
 
-        /// <summary>Whether we already tried to reposition within the home map (only ever done once).</summary>
-        public bool NudgedToBed;
+        /// <summary>
+        /// Whether we already repositioned within the home map. For a farmhand this is the normal path
+        /// (interiors always place you at the entrance); done at most once so a stuck position turns
+        /// into a clean refusal rather than a loop.
+        /// </summary>
+        public bool MovedWithinHome;
     }
 
 
@@ -1794,10 +1798,11 @@ public class ModEntry : Mod
                     return;
                 }
 
-                // Use the 5-arg overload. The 4-arg one we used before takes a *flip* bool, not
-                // isStructure -- so passing false silently told the game "this is a top-level map".
-                // A farmhand's cabin is a building interior, and resolving it as a top-level map is why
-                // the requested bed tile was discarded and the farmer kept landing at the entrance.
+                // Use the 5-arg overload: the 4-arg one takes a *flip* bool, not isStructure, so the
+                // old call silently claimed "top-level map" for a cabin. Correct now -- but note this
+                // alone does NOT get a farmhand onto the bed: measured with isStructure properly set,
+                // a cross-map warp into an interior still lands at the entrance. Landing accurately is
+                // handled after arrival, inside TickSleepAttempt.
                 var isStructure = house is StardewValley.Locations.Cabin || house!.GetParentLocation() != null;
                 Game1.warpFarmer(homeName, bedSpot.X, bedSpot.Y, 2, isStructure);
 
@@ -2088,15 +2093,22 @@ public class ModEntry : Mod
 
         if (!IsOnOwnBed(farmer, house!, attempt.HomeName, attempt.BedSpot))
         {
-            // We're in the right building but not on the bed -- the cross-map warp dropped us at the
-            // entrance. Nudge within this map once and re-check on a later tick. A same-map move needs
-            // no cross-map handshake, so it is far more reliable than re-issuing the warp; and the
-            // verification below still has the final say, so this can only turn a refusal into a
-            // correctly-verified sleep, never into sleeping somewhere wrong.
-            if (!attempt.NudgedToBed)
+            // In the right building but not on the bed, so finish the trip within this map.
+            //
+            // This is the NORMAL path for a farmhand, not an error recovery: a cross-map warp into a
+            // building interior (a cabin) lands at the entrance and the requested tile is ignored --
+            // measured, and it still happens with the correct isStructure overload, so it is engine
+            // behaviour rather than something callers can pass their way out of. The host warping into
+            // the top-level FarmHouse does hit the requested tile and never reaches this branch.
+            //
+            // A same-map move needs no cross-map handshake (verified in multiplayer: the host sees the
+            // farmhand on the bed and the night completes even when the farmhand sleeps last). Done at
+            // most once, and the strict check above still has the final say -- so this can only turn a
+            // refusal into a correctly-verified sleep, never into sleeping somewhere wrong.
+            if (!attempt.MovedWithinHome)
             {
-                attempt.NudgedToBed = true;
-                Monitor.Log($"/sleep: landed at {farmer.TilePoint.X},{farmer.TilePoint.Y} instead of the bed at {attempt.BedSpot.X},{attempt.BedSpot.Y}; moving within {attempt.HomeName}", LogLevel.Debug);
+                attempt.MovedWithinHome = true;
+                Monitor.Log($"/sleep: entered {attempt.HomeName} at {farmer.TilePoint.X},{farmer.TilePoint.Y} (building interiors always place you at the entrance); moving to the bed at {attempt.BedSpot.X},{attempt.BedSpot.Y}", LogLevel.Debug);
                 farmer.Position = new Vector2(attempt.BedSpot.X, attempt.BedSpot.Y) * Game1.tileSize;
                 return;
             }
