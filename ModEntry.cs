@@ -53,33 +53,19 @@ public class ModEntry : Mod
     /// </summary>
     private SleepAttempt? _sleepAttempt;
 
-    /// <summary>
-    /// Held from the moment the farmer is declared ready until the day actually changes, the farmer
-    /// leaves the bed, or the world unloads. Answering "Sleep_Yes" is not the end of sleeping -- in
-    /// multiplayer it only marks this player ready -- so the hold has to outlive the /sleep response.
-    /// While it is held, endpoints that would move the farmer are refused; moving a ready farmer off
-    /// their bed is what leaves everyone else staring at a black screen.
-    /// </summary>
-    private SleepPledge? _sleepPledge;
-
     private sealed class SleepAttempt
     {
         public TaskCompletionSource<object> Tcs = null!;
         public string HomeName = "";
         public Point BedSpot;
 
-        /// <summary>Wall-clock give-up time. Not a tick budget: ticks stall when the game is backgrounded.</summary>
-        public DateTime Deadline;
+        /// <summary>
+        /// Give-up time from <see cref="Environment.TickCount64"/> (monotonic). Not a tick budget --
+        /// ticks stall when the game is backgrounded -- and not DateTime, which jumps with clock changes.
+        /// </summary>
+        public long DeadlineMs;
     }
 
-    private sealed class SleepPledge
-    {
-        public string HomeName = "";
-        public Point BedSpot;
-        public int DayAtPledge;
-        public string SeasonAtPledge = "";
-        public int YearAtPledge;
-    }
 
     // Pathfinding state
     private Queue<Point>? _pathQueue;
@@ -218,7 +204,6 @@ public class ModEntry : Mod
         // blocking the next /sleep (the guard rejects a second attempt) and reporting a misleading
         // "timed out waiting for the warp" when the real reason is that the world went away.
         FinishSleepAttempt(new { ok = false, error = "returned to title while sleeping" });
-        _sleepPledge = null;
     }
 
     private void ClearMovementState()
@@ -397,14 +382,6 @@ public class ModEntry : Mod
         {
             Monitor.Log($"Sleep attempt error: {ex}", LogLevel.Error);
             FinishSleepAttempt(new { ok = false, error = $"internal error: {ex.Message}" });
-        }
-
-        // Release the ready hold once it can no longer deadlock anyone.
-        try { TickSleepPledge(); }
-        catch (Exception ex)
-        {
-            Monitor.Log($"Sleep hold error: {ex}", LogLevel.Error);
-            _sleepPledge = null;
         }
 
         // Freeze time if paused
@@ -743,20 +720,6 @@ public class ModEntry : Mod
 
         try
         {
-            // Refuse movement while the farmer is in bed and ready, before dispatching. Doing it here
-            // rather than inside each handler is deliberate: there are several ways to move the farmer
-            // (/move, /warp, /position, /wakeup) and a per-handler check is one edit away from missing
-            // one. Reads _sleepPledge from the request thread, same as the other handlers read game
-            // state; a stale read can only produce a redundant refusal, never a missed one that matters.
-            object? refusal = RefuseIfSleepHeld(path);
-            if (refusal != null)
-            {
-                // 200 with ok:false, matching how every other handler reports refusal. A different
-                // status code here would break callers that only parse the body.
-                Respond(ctx, 200, refusal);
-                return;
-            }
-
             object? result = path switch
             {
                 "/status" => HandleStatus(),
@@ -1741,9 +1704,12 @@ public class ModEntry : Mod
     /// day ends when everyone is ready. So success is reported as state="ready" (or "slept" in single
     /// player, where the transition is immediate). Callers must not read ok:true as "a new day started".
     ///
-    /// The ready state is then held in <see cref="_sleepPledge"/> until the day actually changes, the
-    /// player leaves the bed, or the world unloads. While it is held, endpoints that would move the
-    /// farmer are refused: moving a ready farmer off their bed is exactly what deadlocked farms.
+    /// KNOWN GAP (tracked separately): while this player is ready but the day has not ended yet,
+    /// nothing here stops a later /warp, /move, /position, /wakeup or a queued command from pulling them
+    /// off the bed -- which leaves them ready but unable to transition and hangs the other players. Do
+    /// not issue movement between /sleep and the new day. Closing that hole needs a main-thread guard
+    /// around every movement path (including the internal path/command queues), which is a bigger change
+    /// than this fix and is deliberately not attempted here.
     /// </summary>
     private object HandleSleep()
     {
@@ -1755,20 +1721,23 @@ public class ModEntry : Mod
         {
             try
             {
-                // Idempotent: a second /sleep while already ready is not an error, but it must not
-                // re-enter the sleep path (that would re-answer Sleep_Yes during the ready-check).
-                if (_sleepPledge != null)
+                // Idempotent: a second /sleep after already declaring ready must not re-answer
+                // "Sleep_Yes" (that re-runs the ready-check). timeWentToBed is the game's own record of
+                // having gone to bed; it is reset to 0 when the ready-check is cancelled. Note that
+                // isInBed is NOT usable for this -- Farmer.Update recomputes it every tick from whether
+                // the current tile is a bed, so it stays true after a cancel.
+                var current = Game1.player;
+                if (current != null && current.timeWentToBed.Value != 0 && !Game1.newDay)
                 {
                     tcs.SetResult(new
                     {
                         ok = true,
                         state = "already_ready",
-                        home = _sleepPledge.HomeName,
-                        bed = $"{_sleepPledge.BedSpot.X},{_sleepPledge.BedSpot.Y}",
-                        note = "already in bed and ready; waiting for the day to end",
+                        note = "already went to bed; waiting for the day to end",
                     });
                     return;
                 }
+
                 if (_sleepAttempt != null)
                 {
                     tcs.SetResult(new { ok = false, error = "a /sleep attempt is already in progress" });
@@ -1817,7 +1786,7 @@ public class ModEntry : Mod
                     Tcs = tcs,
                     HomeName = homeName,
                     BedSpot = bedSpot,
-                    Deadline = DateTime.UtcNow.AddSeconds(12),
+                    DeadlineMs = Environment.TickCount64 + 12_000,
                 };
             }
             catch (Exception ex)
@@ -1853,7 +1822,21 @@ public class ModEntry : Mod
         homeName = "";
         error = "";
 
-        var home = Utility.getHomeOfFarmer(farmer);
+        // getHomeOfFarmer throws (RequireLocation) rather than returning null when the home is missing,
+        // so a null check alone would leave the useful farmhand-specific message unreachable.
+        StardewValley.Locations.FarmHouse? home;
+        try
+        {
+            home = Utility.getHomeOfFarmer(farmer);
+        }
+        catch (Exception ex)
+        {
+            error = farmer.IsMainPlayer
+                ? $"cannot find the farmhouse ({ex.Message})"
+                : $"cannot find this farmhand's cabin -- has one been built and assigned? ({ex.Message})";
+            return false;
+        }
+
         if (home == null)
         {
             error = farmer.IsMainPlayer
@@ -1908,7 +1891,14 @@ public class ModEntry : Mod
         if (loc == null || loc.NameOrUniqueName != homeName)
             return false;
 
+        // Must be the exact sleep spot we resolved, not merely "some bed tile". A double bed is one
+        // BedFurniture instance covering several tiles, so ReferenceEquals alone would also accept the
+        // spouse's side; and IsBedHere alone would accept a child bed. Sleeping on either does not end
+        // the day, which is precisely the mismatch this fix exists to prevent.
         var tile = farmer.TilePoint;
+        if (tile != bedSpot)
+            return false;
+
         var bedHere = StardewValley.Objects.BedFurniture.GetBedAtTile(loc, tile.X, tile.Y);
         if (bedHere == null)
             return false;
@@ -1958,19 +1948,21 @@ public class ModEntry : Mod
         {
             farmer.isInBed.Value = prevInBed;
             farmer.sleptInTemporaryBed.Value = prevTempBed;
-            return new { ok = false, error = $"sleep action threw: {ex.Message}", home = homeName };
-        }
 
-        // Hold the ready state until the day really changes / the farmer leaves the bed / the world
-        // unloads. This is what makes a later /warp refusable instead of silently deadlocking the farm.
-        _sleepPledge = new SleepPledge
-        {
-            HomeName = homeName,
-            BedSpot = bedSpot,
-            DayAtPledge = dayBefore,
-            SeasonAtPledge = Game1.currentSeason ?? "",
-            YearAtPledge = Game1.year,
-        };
+            // Deliberately reported as unknown, not as failure. The throw can happen *after* the game
+            // has already marked this player ready and opened the ready-check (the announce/chat code
+            // runs later in that path), so claiming "did not sleep" would be a lie the caller might act
+            // on. Undoing a net-synced ready needs more than resetting these two flags, so this reports
+            // the uncertainty instead of pretending either way.
+            return new
+            {
+                ok = false,
+                state = "unknown",
+                error = $"sleep action threw after being sent: {ex.Message}",
+                home = homeName,
+                note = "the go-to-bed action was already dispatched; this player may or may not be marked ready. Check /state before retrying.",
+            };
+        }
 
         // Single player transitions immediately; multiplayer waits for the other players.
         var ended = Game1.newDay || Game1.dayOfMonth != dayBefore;
@@ -1994,7 +1986,7 @@ public class ModEntry : Mod
         if (attempt == null)
             return;
 
-        if (DateTime.UtcNow > attempt.Deadline)
+        if (Environment.TickCount64 > attempt.DeadlineMs)
         {
             var where = Game1.player?.currentLocation?.NameOrUniqueName ?? "unknown";
             FinishSleepAttempt(new
@@ -2054,66 +2046,6 @@ public class ModEntry : Mod
             return;
         _sleepAttempt = null;
         attempt.Tcs.TrySetResult(result);
-    }
-
-    /// <summary>
-    /// Releases the ready state once it can no longer deadlock anyone: the day changed, the farmer is
-    /// out of bed again (ready-check cancelled), or the world went away.
-    /// </summary>
-    private void TickSleepPledge()
-    {
-        var pledge = _sleepPledge;
-        if (pledge == null)
-            return;
-
-        if (!Context.IsWorldReady || Game1.player == null)
-        {
-            _sleepPledge = null;
-            return;
-        }
-
-        if (Game1.dayOfMonth != pledge.DayAtPledge
-            || Game1.year != pledge.YearAtPledge
-            || (Game1.currentSeason ?? "") != pledge.SeasonAtPledge)
-        {
-            Monitor.Log("/sleep: day advanced, releasing sleep hold", LogLevel.Debug);
-            _sleepPledge = null;
-            return;
-        }
-
-        // Cancelled via the ready-check (or otherwise put back on their feet).
-        if (!Game1.player.isInBed.Value && !Game1.newDay)
-        {
-            Monitor.Log("/sleep: farmer left the bed, releasing sleep hold", LogLevel.Debug);
-            _sleepPledge = null;
-        }
-    }
-
-    /// <summary>
-    /// Endpoints refused while the farmer is in bed and ready. Moving a ready farmer off their bed
-    /// leaves them ready but unable to transition, which hangs the whole farm on a black screen --
-    /// this was reproduced directly: /sleep followed 0.24s later by /warp pulled the farmer out and
-    /// left a stale ready-check behind.
-    /// </summary>
-    private static readonly HashSet<string> SleepBlockedEndpoints = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "/move", "/warp", "/position", "/wakeup",
-    };
-
-    /// <summary>Returns a refusal payload when <paramref name="path"/> must not run during a sleep hold.</summary>
-    private object? RefuseIfSleepHeld(string path)
-    {
-        var pledge = _sleepPledge;
-        if (pledge == null || !SleepBlockedEndpoints.Contains(path))
-            return null;
-
-        return new
-        {
-            ok = false,
-            error = $"refused: the farmer is in bed and ready to sleep, and '{path}' would move them off the bed (that hangs the other players). Wait for the day to end, or cancel the sleep prompt in-game first.",
-            home = pledge.HomeName,
-            bed = $"{pledge.BedSpot.X},{pledge.BedSpot.Y}",
-        };
     }
 
     /// <summary>

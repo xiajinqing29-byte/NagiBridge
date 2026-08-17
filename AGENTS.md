@@ -80,7 +80,7 @@
 | `/alerts` | GET/POST | 游戏内警告队列 |
 | `/scan` | GET | 扫描当前地图全部物体 |
 | `/warp` | POST | 传送 `{location, x?, y?}` 矿洞用 `UndergroundMine5` |
-| `/sleep` | POST | 回自己的床睡觉、结束这一天。**自动找床**（不需要先 `/warp` 回家），会等传送完成并确认真的在床上才睡。**必须检查返回值**：`ok:false` 时 `error` 说明卡在哪一步 |
+| `/sleep` | POST | 回自己的床睡觉。**自动找床**（不需要先 `/warp` 回家），等传送完成并确认精确站在自己床上才睡；做不到就返回 `ok:false` 而不是硬睡。**必须检查返回值**。`state` 有三种：`slept`（单人，已过夜）/ `ready`（多人，已上床，**日期要等所有人就绪才变**）/ `unknown`（动作已发出但出错，先查 `/state`）。⚠️ **`ok:true` 不等于新的一天开始了** |
 | `/wakeup` | POST | 起床 |
 | `/buy` | POST | 购买 `{id, count, price?}` |
 | `/sell` | POST | 出售到shipping bin |
@@ -173,6 +173,18 @@ Start-Process "E:\SteamLibrary\steamapps\common\Stardew Valley\StardewModdingAPI
 until curl -s http://localhost:7842/status 2>/dev/null | grep -q '"worldReady":true'; do sleep 5; done
 echo "Game ready!"
 ```
+
+## ⚠️ 睡觉期间不要移动（已知限制）
+
+多人模式下 `/sleep` 返回 `state:"ready"` 之后、日期真正变化之前，**不要再发任何会移动农场帮手的指令**
+（`/warp`、`/move`、`/position`、`/wakeup`，以及 `/queue` 里的 move/warp）。
+
+原因：这段时间里这名玩家已被标记为「已就绪」。把一个已就绪的玩家从床上移开，他会保持就绪但**永远不会进入过夜**，
+于是所有人卡在黑屏等他 —— 这正是 1.0.0 那个死锁的形状，只是触发方式不同。已实测复现：`/sleep` 之后 0.24 秒发
+`/warp`，人被拉到农田却仍弹出睡觉等待框，随后又被拉回屋里。
+
+**当前版本不会拦你**，这层保护要改动所有移动路径（含内部队列），另行处理。在那之前请靠调用顺序避开：
+睡了就别再动他，等日期变了再发指令。
 
 ## 卡住检测
 每次操作后检查 /state 的 activeMenu 字段：
