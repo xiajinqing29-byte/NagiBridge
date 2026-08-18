@@ -36,6 +36,44 @@ public class ModEntry : Mod
     private readonly object _queueLock = new();
     private int _port;
 
+    /// <summary>
+    /// In-flight /sleep attempt. See <see cref="HandleSleep"/>.
+    ///
+    /// Why this exists: /sleep used to warp the farmer to a hardcoded tile (10,6) and then, after a
+    /// fixed 3000ms timer, force isInBed = true and answer "Sleep_Yes" without ever checking where the
+    /// farmer actually ended up. In multiplayer that deadlocked the whole farm: the bed is not at
+    /// (10,6) in most homes (cabins are smaller than the farmhouse, and the farmhouse itself swaps maps
+    /// on upgrade / marriage), so the game rejected the target and dropped the farmer at the entrance
+    /// instead. The farmer still reached "ready", the last player to sleep sent everyone into NewDay,
+    /// but a farmer who is not on a bed never transitions -- so the host sat on a black screen forever
+    /// while the farmer stood in the doorway.
+    ///
+    /// Fix: ask the game where the bed is, wait for the warp to actually finish, verify the farmer is
+    /// standing on a bed, and only then sleep. If any step fails, report it instead of pretending.
+    /// </summary>
+    private SleepAttempt? _sleepAttempt;
+
+    private sealed class SleepAttempt
+    {
+        public TaskCompletionSource<object> Tcs = null!;
+        public string HomeName = "";
+        public Point BedSpot;
+
+        /// <summary>
+        /// Give-up time from <see cref="Environment.TickCount64"/> (monotonic). Not a tick budget --
+        /// ticks stall when the game is backgrounded -- and not DateTime, which jumps with clock changes.
+        /// </summary>
+        public long DeadlineMs;
+
+        /// <summary>
+        /// Whether we already repositioned within the home map. For a farmhand this is the normal path
+        /// (interiors always place you at the entrance); done at most once so a stuck position turns
+        /// into a clean refusal rather than a loop.
+        /// </summary>
+        public bool MovedWithinHome;
+    }
+
+
     // Pathfinding state
     private Queue<Point>? _pathQueue;
     private int _pathTickCooldown;
@@ -168,6 +206,11 @@ public class ModEntry : Mod
     private void OnReturnedToTitle(object? sender, ReturnedToTitleEventArgs e)
     {
         ClearMovementState();
+
+        // Release any in-flight /sleep. Without this the attempt would sit there until it timed out,
+        // blocking the next /sleep (the guard rejects a second attempt) and reporting a misleading
+        // "timed out waiting for the warp" when the real reason is that the world went away.
+        FinishSleepAttempt(new { ok = false, error = "returned to title while sleeping" });
     }
 
     private void ClearMovementState()
@@ -337,6 +380,15 @@ public class ModEntry : Mod
                 try { _mainThreadQueue.Dequeue().Invoke(); }
                 catch (Exception ex) { Monitor.Log($"Queued action error: {ex}", LogLevel.Error); }
             }
+        }
+
+        // Advance an in-flight /sleep attempt. Must run every tick (not on a timer) so we can react to
+        // the warp actually completing instead of guessing how long it takes.
+        try { TickSleepAttempt(); }
+        catch (Exception ex)
+        {
+            Monitor.Log($"Sleep attempt error: {ex}", LogLevel.Error);
+            FinishSleepAttempt(new { ok = false, error = $"internal error: {ex.Message}" });
         }
 
         // Freeze time if paused
@@ -1652,7 +1704,19 @@ public class ModEntry : Mod
 
     /// <summary>
     /// POST /sleep
-    /// Warps the farmer to their bed and triggers sleep (end of day).
+    /// Puts the farmer in their own bed and declares them ready to end the day.
+    ///
+    /// Returns when the outcome of *getting into bed* is known -- not when the day has actually ended.
+    /// In multiplayer, answering "Sleep_Yes" only marks this player ready and opens a ready-check; the
+    /// day ends when everyone is ready. So success is reported as state="ready" (or "slept" in single
+    /// player, where the transition is immediate). Callers must not read ok:true as "a new day started".
+    ///
+    /// KNOWN GAP (tracked separately): while this player is ready but the day has not ended yet,
+    /// nothing here stops a later /warp, /move, /position, /wakeup or a queued command from pulling them
+    /// off the bed -- which leaves them ready but unable to transition and hangs the other players. Do
+    /// not issue movement between /sleep and the new day. Closing that hole needs a main-thread guard
+    /// around every movement path (including the internal path/command queues), which is a bigger change
+    /// than this fix and is deliberately not attempted here.
     /// </summary>
     private object HandleSleep()
     {
@@ -1664,71 +1728,102 @@ public class ModEntry : Mod
         {
             try
             {
-                var farmer = Game1.player;
-
-                // Find home: try homeLocation, then scan all locations for a cabin belonging to this farmer
-                var homeName = farmer.homeLocation.Value;
-                GameLocation homeLoc = null;
-                if (!string.IsNullOrEmpty(homeName))
-                    homeLoc = Game1.getLocationFromName(homeName);
-
-                if (homeLoc == null)
+                // Idempotent: once this farmer has gone to bed, never re-answer "Sleep_Yes" (that
+                // re-runs the ready-check). timeWentToBed is the game's own record of having gone to
+                // bed and is reset to 0 when the check is cancelled -- isInBed is NOT usable here,
+                // because Farmer.Update recomputes it every tick from whether the current tile is a
+                // bed, so it stays true even after a cancel.
+                //
+                // Don't collapse this into "already ready", though: startSleep writes timeWentToBed
+                // *before* marking the player ready, so a non-zero value on its own only proves the
+                // attempt started. Report what is actually observable.
+                var current = Game1.player;
+                if (current != null && current.timeWentToBed.Value != 0)
                 {
-                    // Scan for cabin with this farmer's unique ID
-                    foreach (var loc in Game1.locations)
-                    {
-                        if (loc is StardewValley.Locations.Cabin cabin && cabin.owner == farmer)
+                    if (Game1.newDay)
+                        tcs.SetResult(new { ok = true, state = "day_ending", note = "the day is already ending" });
+                    else if (IsSleepReadyCheckOpen())
+                        tcs.SetResult(new { ok = true, state = "already_ready", note = "already in bed and ready; the day ends when everyone is ready" });
+                    else
+                        // ok:false on purpose. timeWentToBed is written *before* the player is marked
+                        // ready, so a non-zero value with no ready-check and no newDay may mean the
+                        // attempt threw before ready was ever set. Reporting that as success would be
+                        // the same "assume it worked" mistake this whole fix exists to remove -- just in
+                        // a different place. Not retrying Sleep_Yes either; the caller decides.
+                        tcs.SetResult(new
                         {
-                            homeLoc = cabin;
-                            homeName = cabin.Name;
-                            break;
-                        }
-                    }
-                }
-
-                // Fallback to FarmHouse for host
-                if (homeLoc == null)
-                {
-                    homeLoc = Game1.getLocationFromName("FarmHouse");
-                    homeName = "FarmHouse";
-                }
-
-                if (homeLoc == null)
-                {
-                    tcs.SetResult(new { ok = false, error = "Cannot find home location" });
+                            ok = false,
+                            state = "already_started",
+                            error = "went to bed earlier, but there is no evidence this player is ready (no sleep ready-check, no new day)",
+                            note = "not retrying the sleep action. Inspect 'observed' to decide.",
+                            observed = ObserveSleepState(current),
+                        });
                     return;
                 }
 
-                var bedX = 10;
-                var bedY = 6;
-
-                var needsWarp = farmer.currentLocation.Name != homeLoc.Name;
-                if (needsWarp)
+                if (_sleepAttempt != null)
                 {
-                    Game1.warpFarmer(homeName, bedX, bedY, false);
+                    tcs.SetResult(new { ok = false, error = "a /sleep attempt is already in progress" });
+                    return;
                 }
 
-                // Longer delay for farmhand warp sync
-                var delay = needsWarp ? 3000 : 500;
-                DelayedAction.functionAfterDelay(() =>
+                if (!TryCheckSleepPreconditions(out var pre))
                 {
-                    var f = Game1.player;
-                    f.isInBed.Value = true;
-                    f.sleptInTemporaryBed.Value = false;
-                    f.currentLocation.answerDialogueAction("Sleep_Yes", Array.Empty<string>());
+                    tcs.SetResult(new { ok = false, error = pre });
+                    return;
+                }
 
-                    DelayedAction.functionAfterDelay(() =>
-                    {
-                        if (Game1.activeClickableMenu != null)
-                        {
-                            Game1.player.currentLocation.answerDialogueAction("Sleep_Yes", Array.Empty<string>());
-                            Game1.pressActionButton(Game1.input.GetKeyboardState(), Game1.input.GetMouseState(),
-                                Game1.input.GetGamePadState());
-                        }
-                    }, 1000);
-                }, delay);
+                var farmer = Game1.player;
+                if (farmer == null)
+                {
+                    tcs.SetResult(new { ok = false, error = "no player" });
+                    return;
+                }
 
-                tcs.SetResult(new { ok = true, action = "sleeping", home = homeName, bed = $"{bedX},{bedY}" });
+                if (!TryResolveHome(farmer, out var house, out var homeName, out var homeError))
+                {
+                    tcs.SetResult(new { ok = false, error = homeError });
+                    return;
+                }
+                if (!TryResolveOwnBedSpot(house!, out var bedSpot, out var bedError))
+                {
+                    tcs.SetResult(new { ok = false, error = bedError, home = homeName });
+                    return;
+                }
+
+                // Already on our own bed at home: no warp needed.
+                if (IsOnOwnBed(farmer, house!, homeName, bedSpot))
+                {
+                    tcs.SetResult(SleepNow(farmer, homeName, bedSpot));
+                    return;
+                }
+
+                // Use the 5-arg overload: the 4-arg one takes a *flip* bool, not isStructure, so the
+                // old call silently claimed "top-level map" for a cabin. Correct now -- but note this
+                // alone does NOT get a farmhand onto the bed: measured with isStructure properly set,
+                // a cross-map warp into an interior still lands at the entrance. Landing accurately is
+                // handled after arrival, inside TickSleepAttempt.
+                // Only a cabin is a building interior here. Utility.getHomeOfFarmer returns exactly
+                // FarmHouse (host) or Cabin (farmhand), so this test is complete on its own.
+                // Do NOT widen it with "|| GetParentLocation() != null": the host's FarmHouse also has
+                // a parent location, so that form misclassifies the host's own home as an interior --
+                // a strictly wrong classification, whatever its runtime effect turns out to be.
+                // (A host timeout was observed while that form was in place, but those runs were
+                // confounded by the game pausing when unfocused, so it is not evidence of causation.)
+                var isStructure = house is StardewValley.Locations.Cabin;
+                Game1.warpFarmer(homeName, bedSpot.X, bedSpot.Y, 2, isStructure);
+
+                // Wall-clock deadline, not a tick count: ticks stall when the game is backgrounded or
+                // running below 60fps, and a stalled tick budget would outlive the caller's HTTP
+                // timeout (scripts/tool_agent.py uses 30s) -- the client would give up while the state
+                // machine kept acting. 12s leaves room under that.
+                _sleepAttempt = new SleepAttempt
+                {
+                    Tcs = tcs,
+                    HomeName = homeName,
+                    BedSpot = bedSpot,
+                    DeadlineMs = Environment.TickCount64 + 12_000,
+                };
             }
             catch (Exception ex)
             {
@@ -1736,6 +1831,316 @@ public class ModEntry : Mod
             }
         });
         return tcs.Task.GetAwaiter().GetResult();
+    }
+
+    /// <summary>States that make it unsafe to start sleeping. Checked at entry and re-checked while waiting.</summary>
+    private static bool TryCheckSleepPreconditions(out string error)
+    {
+        error = "";
+        if (Game1.newDay) { error = "the day is already ending"; return false; }
+        if (Game1.eventUp) { error = "busy: an event is playing"; return false; }
+        if (Game1.currentMinigame != null) { error = "busy: a minigame is active"; return false; }
+        // A warp or fade in flight would move or interrupt us after we declare ready.
+        if (Game1.locationRequest != null) { error = "busy: a warp is already in progress"; return false; }
+        if (Game1.fadeToBlack) { error = "busy: the screen is fading"; return false; }
+        if (Game1.activeClickableMenu != null) { error = $"busy: a menu is open ({Game1.activeClickableMenu.GetType().Name})"; return false; }
+        return true;
+    }
+
+    /// <summary>
+    /// Resolves this farmer's own home. Uses the game's own lookup rather than reimplementing it:
+    /// a farmhand's cabin is a building interior and is not reliably present in Game1.locations, and
+    /// falling back to the host's FarmHouse would send a farmhand to someone else's bed.
+    /// </summary>
+    private static bool TryResolveHome(Farmer farmer, out StardewValley.Locations.FarmHouse? house, out string homeName, out string error)
+    {
+        house = null;
+        homeName = "";
+        error = "";
+
+        // getHomeOfFarmer throws (RequireLocation) rather than returning null when the home is missing,
+        // so a null check alone would leave the useful farmhand-specific message unreachable.
+        StardewValley.Locations.FarmHouse? home;
+        try
+        {
+            home = Utility.getHomeOfFarmer(farmer);
+        }
+        catch (Exception ex)
+        {
+            error = farmer.IsMainPlayer
+                ? $"cannot find the farmhouse ({ex.Message})"
+                : $"cannot find this farmhand's cabin -- has one been built and assigned? ({ex.Message})";
+            return false;
+        }
+
+        if (home == null)
+        {
+            error = farmer.IsMainPlayer
+                ? "cannot find the farmhouse"
+                : "cannot find this farmhand's cabin (has a cabin been built and assigned?)";
+            return false;
+        }
+
+        house = home;
+        homeName = home.NameOrUniqueName;
+        return true;
+    }
+
+    /// <summary>
+    /// Asks the game for this farmer's bed tile.
+    ///
+    /// Deliberately does NOT use GetPlayerBedSpot(): in 1.6 that is
+    /// GetPlayerBed()?.GetBedSpot() ?? getEntryLocation(), so when there is no bed it silently returns
+    /// the doorway -- which is how the original bug ended up sleeping in an entrance. Go to the bed
+    /// furniture directly and verify exactly once.
+    /// </summary>
+    private static bool TryResolveOwnBedSpot(StardewValley.Locations.FarmHouse house, out Point bedSpot, out string error)
+    {
+        bedSpot = Point.Zero;
+        error = "";
+
+        var bed = house.GetPlayerBed();
+        if (bed == null)
+        {
+            error = $"no bed found in '{house.NameOrUniqueName}' (was it removed or put in storage?)";
+            return false;
+        }
+
+        var spot = bed.GetBedSpot();
+        if (!StardewValley.Objects.BedFurniture.IsBedHere(house, spot.X, spot.Y))
+        {
+            error = $"the bed in '{house.NameOrUniqueName}' reports tile {spot.X},{spot.Y} but no bed is there";
+            return false;
+        }
+
+        bedSpot = spot;
+        return true;
+    }
+
+    /// <summary>
+    /// True only when the farmer stands on *their own* bed at home. IsBedHere alone is not enough --
+    /// a child bed or a spouse's side also satisfies it, and sleeping there does not end the day.
+    /// </summary>
+    private static bool IsOnOwnBed(Farmer farmer, StardewValley.Locations.FarmHouse house, string homeName, Point bedSpot)
+    {
+        var loc = farmer.currentLocation;
+        if (loc == null || loc.NameOrUniqueName != homeName)
+            return false;
+
+        // Must be the exact sleep spot we resolved, not merely "some bed tile". A double bed is one
+        // BedFurniture instance covering several tiles, so ReferenceEquals alone would also accept the
+        // spouse's side; and IsBedHere alone would accept a child bed. Sleeping on either does not end
+        // the day, which is precisely the mismatch this fix exists to prevent.
+        var tile = farmer.TilePoint;
+        if (tile != bedSpot)
+            return false;
+
+        var bedHere = StardewValley.Objects.BedFurniture.GetBedAtTile(loc, tile.X, tile.Y);
+        if (bedHere == null)
+            return false;
+
+        var ownBed = house.GetPlayerBed();
+        return ownBed != null && ReferenceEquals(bedHere, ownBed);
+    }
+
+    /// <summary>
+    /// Gets into bed and answers the sleep prompt. Only call once the farmer is confirmed to be on
+    /// their own bed: declaring ready anywhere else marks the player ready without letting them
+    /// transition, which hangs everyone else on a black screen.
+    /// </summary>
+    private object SleepNow(Farmer farmer, string homeName, Point bedSpot)
+    {
+        var loc = farmer.currentLocation;
+        if (loc == null)
+            return new { ok = false, error = "no current location" };
+
+        var prevInBed = farmer.isInBed.Value;
+        var prevTempBed = farmer.sleptInTemporaryBed.Value;
+        var dayBefore = Game1.dayOfMonth;
+
+        farmer.isInBed.Value = true;
+        // Safe only because we verified this is the farmer's own bed at home.
+        farmer.sleptInTemporaryBed.Value = false;
+
+        try
+        {
+            // NOTE: the return value is not proof of anything -- answerDialogueAction returns true for
+            // any non-null action. It is checked only to catch an outright rejection.
+            if (!loc.answerDialogueAction("Sleep_Yes", Array.Empty<string>()))
+            {
+                // Outright refusal, so nothing was marked ready and undoing our own writes is safe --
+                // unlike the catch below, where the throw may land after the ready-check opened.
+                // Note the isInBed write only holds for this tick (Farmer.Update recomputes it from the
+                // current tile); the meaningful part of this rollback is sleptInTemporaryBed.
+                farmer.isInBed.Value = prevInBed;
+                farmer.sleptInTemporaryBed.Value = prevTempBed;
+                return new
+                {
+                    ok = false,
+                    error = "the game refused the sleep action",
+                    home = homeName,
+                    bed = $"{bedSpot.X},{bedSpot.Y}",
+                    at = $"{farmer.TilePoint.X},{farmer.TilePoint.Y}",
+                };
+            }
+        }
+        catch (Exception ex)
+        {
+            // Deliberately NOT rolling isInBed / sleptInTemporaryBed back here.
+            //
+            // We only get this far after verifying the farmer is standing on their own real bed, and we
+            // set those flags to match that fact. If the throw happened after the game already marked
+            // this player ready, restoring the old values would briefly produce "ready but not in bed"
+            // -- exactly the inconsistent state this whole fix exists to prevent. Staying on the real
+            // bed is the safe fail state; if the throw happened before ready, staying is harmless.
+            //
+            // Reported as unknown rather than failure: the throw can land after the ready-check has
+            // already opened (the announce/chat code runs later in that path), so claiming "did not
+            // sleep" would be a lie the caller might act on. Undoing a net-synced ready is out of scope
+            // here, so report the uncertainty with the evidence instead of guessing either way.
+            Monitor.Log($"/sleep threw after dispatching the sleep action: {ex}", LogLevel.Error);
+            return new
+            {
+                ok = false,
+                state = "unknown",
+                error = $"sleep action threw after being sent: {ex.Message}",
+                home = homeName,
+                bed = $"{bedSpot.X},{bedSpot.Y}",
+                note = "the go-to-bed action was already dispatched; this player may or may not be marked ready. Inspect 'observed' rather than retrying blind.",
+                observed = ObserveSleepState(farmer),
+            };
+        }
+
+        // Single player transitions immediately; multiplayer waits for the other players.
+        var ended = Game1.newDay || Game1.dayOfMonth != dayBefore;
+        var state = ended ? "slept" : "ready";
+        Monitor.Log($"/sleep: {state} in {homeName} at {farmer.TilePoint.X},{farmer.TilePoint.Y}", LogLevel.Info);
+
+        return new
+        {
+            ok = true,
+            state,
+            home = homeName,
+            bed = $"{bedSpot.X},{bedSpot.Y}",
+            note = ended ? "the day is ending" : "in bed and ready; the day ends when everyone is ready",
+        };
+    }
+
+    /// <summary>True when a "sleep" ready-check is on screen -- direct evidence this player is ready.</summary>
+    private static bool IsSleepReadyCheckOpen()
+    {
+        return Game1.activeClickableMenu is ReadyCheckDialog dialog
+            && string.Equals(dialog.checkName, "sleep", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Sleep-related state that /state does not expose (timeWentToBed, isInBed, newDay, fade, which
+    /// ready-check is open). Attached to ambiguous /sleep responses so "state is unclear" comes with the
+    /// evidence instead of pointing the caller at an endpoint that cannot show any of it.
+    /// </summary>
+    private static object ObserveSleepState(Farmer? farmer)
+    {
+        return new
+        {
+            timeWentToBed = farmer?.timeWentToBed.Value,
+            isInBed = farmer?.isInBed.Value,
+            sleptInTemporaryBed = farmer?.sleptInTemporaryBed.Value,
+            newDay = Game1.newDay,
+            fadeToBlack = Game1.fadeToBlack,
+            activeMenu = Game1.activeClickableMenu?.GetType().Name,
+            readyCheck = (Game1.activeClickableMenu as ReadyCheckDialog)?.checkName,
+            location = farmer?.currentLocation?.NameOrUniqueName,
+            at = farmer == null ? null : $"{farmer.TilePoint.X},{farmer.TilePoint.Y}",
+        };
+    }
+
+    /// <summary>Waits for the warp issued by <see cref="HandleSleep"/> to finish, then verifies and sleeps.</summary>
+    private void TickSleepAttempt()
+    {
+        var attempt = _sleepAttempt;
+        if (attempt == null)
+            return;
+
+        if (Environment.TickCount64 > attempt.DeadlineMs)
+        {
+            var where = Game1.player?.currentLocation?.NameOrUniqueName ?? "unknown";
+            FinishSleepAttempt(new
+            {
+                ok = false,
+                error = $"timed out waiting for the warp to '{attempt.HomeName}' to finish (still in '{where}')",
+                home = attempt.HomeName,
+            });
+            return;
+        }
+
+        // Re-check: something may have started an event, a menu or another warp while we waited.
+        if (!TryCheckSleepPreconditions(out var pre))
+        {
+            // A warp/fade in flight is expected here -- that's the warp we issued. Anything else aborts.
+            if (Game1.locationRequest != null || Game1.fadeToBlack)
+                return;
+            FinishSleepAttempt(new { ok = false, error = $"aborted while warping: {pre}", home = attempt.HomeName });
+            return;
+        }
+
+        var farmer = Game1.player;
+        if (farmer?.currentLocation == null)
+            return;
+        if (farmer.currentLocation.NameOrUniqueName != attempt.HomeName)
+            return;
+
+        // Arrived. Re-resolve the home so we compare against a live bed instance, then verify we are on
+        // it. The game silently relocates the farmer when the requested tile isn't standable, and that
+        // mismatch is the whole bug.
+        if (!TryResolveHome(farmer, out var house, out _, out var homeError))
+        {
+            FinishSleepAttempt(new { ok = false, error = homeError, home = attempt.HomeName });
+            return;
+        }
+
+        if (!IsOnOwnBed(farmer, house!, attempt.HomeName, attempt.BedSpot))
+        {
+            // In the right building but not on the bed, so finish the trip within this map.
+            //
+            // This is the NORMAL second stage, not error recovery, and it applies to BOTH roles: a
+            // cross-map warp home may deposit you at the map entry regardless of whether the home is a
+            // cabin or the top-level farmhouse (measured for both). Passing the bed tile to warpFarmer
+            // is not enough on its own.
+            //
+            // A same-map move needs no cross-map handshake (verified in multiplayer: the host sees the
+            // farmhand on the bed and the night completes even when the farmhand sleeps last). Done at
+            // most once, and the strict check above still has the final say -- so this can only turn a
+            // refusal into a correctly-verified sleep, never into sleeping somewhere wrong.
+            if (!attempt.MovedWithinHome)
+            {
+                attempt.MovedWithinHome = true;
+                Monitor.Log($"/sleep: cross-map warp home entered {attempt.HomeName} at {farmer.TilePoint.X},{farmer.TilePoint.Y} (map entry); moving within home to the bed at {attempt.BedSpot.X},{attempt.BedSpot.Y}", LogLevel.Debug);
+                farmer.Position = new Vector2(attempt.BedSpot.X, attempt.BedSpot.Y) * Game1.tileSize;
+                return;
+            }
+
+            FinishSleepAttempt(new
+            {
+                ok = false,
+                error = "arrived home but could not get onto your own bed -- refusing to sleep (declaring ready here would hang the other players)",
+                home = attempt.HomeName,
+                bed = $"{attempt.BedSpot.X},{attempt.BedSpot.Y}",
+                at = $"{farmer.TilePoint.X},{farmer.TilePoint.Y}",
+                observed = ObserveSleepState(farmer),
+            });
+            return;
+        }
+
+        FinishSleepAttempt(SleepNow(farmer, attempt.HomeName, attempt.BedSpot));
+    }
+
+    private void FinishSleepAttempt(object result)
+    {
+        var attempt = _sleepAttempt;
+        if (attempt == null)
+            return;
+        _sleepAttempt = null;
+        attempt.Tcs.TrySetResult(result);
     }
 
     /// <summary>
