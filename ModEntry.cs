@@ -1804,10 +1804,12 @@ public class ModEntry : Mod
                 // a cross-map warp into an interior still lands at the entrance. Landing accurately is
                 // handled after arrival, inside TickSleepAttempt.
                 // Only a cabin is a building interior here. Utility.getHomeOfFarmer returns exactly
-                // FarmHouse (host) or Cabin (farmhand), so this test is complete.
-                // Do NOT add "|| GetParentLocation() != null" as a safety net: the host's FarmHouse
-                // does have a parent location, yet warp still resolves it as a top-level map -- that
-                // "safety net" made every host cross-map warp fail to complete (measured: 12s timeout).
+                // FarmHouse (host) or Cabin (farmhand), so this test is complete on its own.
+                // Do NOT widen it with "|| GetParentLocation() != null": the host's FarmHouse also has
+                // a parent location, so that form misclassifies the host's own home as an interior --
+                // a strictly wrong classification, whatever its runtime effect turns out to be.
+                // (A host timeout was observed while that form was in place, but those runs were
+                // confounded by the game pausing when unfocused, so it is not evidence of causation.)
                 var isStructure = house is StardewValley.Locations.Cabin;
                 Game1.warpFarmer(homeName, bedSpot.X, bedSpot.Y, 2, isStructure);
 
@@ -2100,11 +2102,10 @@ public class ModEntry : Mod
         {
             // In the right building but not on the bed, so finish the trip within this map.
             //
-            // This is the NORMAL path for a farmhand, not an error recovery: a cross-map warp into a
-            // building interior (a cabin) lands at the entrance and the requested tile is ignored --
-            // measured, and it still happens with the correct isStructure overload, so it is engine
-            // behaviour rather than something callers can pass their way out of. The host warping into
-            // the top-level FarmHouse does hit the requested tile and never reaches this branch.
+            // This is the NORMAL second stage, not error recovery, and it applies to BOTH roles: a
+            // cross-map warp home may deposit you at the map entry regardless of whether the home is a
+            // cabin or the top-level farmhouse (measured for both). Passing the bed tile to warpFarmer
+            // is not enough on its own.
             //
             // A same-map move needs no cross-map handshake (verified in multiplayer: the host sees the
             // farmhand on the bed and the night completes even when the farmhand sleeps last). Done at
@@ -2113,7 +2114,7 @@ public class ModEntry : Mod
             if (!attempt.MovedWithinHome)
             {
                 attempt.MovedWithinHome = true;
-                Monitor.Log($"/sleep: entered {attempt.HomeName} at {farmer.TilePoint.X},{farmer.TilePoint.Y} (building interiors always place you at the entrance); moving to the bed at {attempt.BedSpot.X},{attempt.BedSpot.Y}", LogLevel.Debug);
+                Monitor.Log($"/sleep: cross-map warp home entered {attempt.HomeName} at {farmer.TilePoint.X},{farmer.TilePoint.Y} (map entry); moving within home to the bed at {attempt.BedSpot.X},{attempt.BedSpot.Y}", LogLevel.Debug);
                 farmer.Position = new Vector2(attempt.BedSpot.X, attempt.BedSpot.Y) * Game1.tileSize;
                 return;
             }
