@@ -209,3 +209,7 @@ pip install requests
 | `shop_buy.py` | `python shop_buy.py --items "493:10,491:6"` |
 
 All scripts default to `--port 7842`. Add `PYTHONIOENCODING=utf-8` on Windows.
+
+## License
+
+[MIT](LICENSE). Use it, change it, ship it — just keep the copyright notice.
